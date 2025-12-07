@@ -10,7 +10,7 @@ const crypto = require("crypto");
 
 const admin = require("firebase-admin");
 
-const serviceAccount = require("./zapp-shift-client-firebase-adminsdk-fbsvc-828964ac3c.json");
+const serviceAccount = require(process.env.FIREBASE_ADMIN_SDK_PATH);
 
 admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
