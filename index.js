@@ -10,7 +10,7 @@ const crypto = require("crypto");
 
 const admin = require("firebase-admin");
 
-const serviceAccount = require("./zapp-shift-client-firebase-adminsdk.json");
+const serviceAccount = require("./zapp-shift-client-firebase-adminsdk-fbsvc-828964ac3c.json");
 
 admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
@@ -46,6 +46,8 @@ const verifyFBToken = async (req, res, next) => {
     }
 };
 
+
+
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.fdcjmvl.mongodb.net/?appName=Cluster0`;
 // Create a MongoClient with a MongoClientOptions object to set the Stable API version
 const client = new MongoClient(uri, {
@@ -67,7 +69,61 @@ async function run() {
         const paymentCollection = db.collection("payments");
         const ridersCollection = db.collection("riders");
 
+        // midlewear with database access for admin verify
+        // must be used after verifyFBToken middleware
+
+        const verifyAdmin = async (req, res, next) => {
+            const email = req.decoded_email;
+            const query = {email}
+            const user = await userCollection.findOne(query);
+            if(!user || user.role !== 'admin'){
+                return res.status(403).send({message: 'forbidden access'})
+            }
+            next()
+        }
+           
+
         // users api
+        app.get("/users", verifyFBToken, async (req, res) => {
+            const searchText = req.query.searchText;
+            const query = {};
+            if(searchText){
+                // query.displayName = {$regex: searchText, $options: 'i'}
+                query.$or = [
+                    { displayName: { $regex: searchText, $options: "i" } },
+                    { email: { $regex: searchText, $options: "i" } },
+                ];
+            }
+
+            const cursor = userCollection.find(query).sort({ createdAt: -1 }).limit(6)
+            const result = await cursor.toArray();
+            res.send(result);
+        });
+
+        app.get("/users/:id", async (req, res) => {
+            
+        });
+        // role based access
+        app.get("/users/:email/role",  async (req, res) => {
+            const email = req.params.email;
+            const query = { email: email };
+            const user = await userCollection.findOne(query);
+            res.send({ role: user?.role || "user" });
+        });
+
+        app.patch("/users/:id/role", verifyFBToken, verifyAdmin, async (req, res) => {
+            const id = req.params.id;
+            const roleInfo = req.body;
+            const query = { _id: new ObjectId(id) };
+            const updatedDoc = {
+                $set: {
+                    role: roleInfo.role,
+                },
+            };
+            const result = await userCollection.updateOne(query, updatedDoc);
+            res.send(result);
+        });
+
         app.post("/users", async (req, res) => {
             const user = req.body;
             user.role = "user";
@@ -87,10 +143,15 @@ async function run() {
 
         app.get("/parcels", async (req, res) => {
             const query = {};
-            const { email } = req.query;
+            const { email, deliveryStatus } = req.query;
             if (email) {
                 query.senderEmail = email;
             }
+
+            if(deliveryStatus){
+                query.deliveryStatus = deliveryStatus
+            }
+
             const options = { sort: { createdAt: -1 } };
             const cursor = parcelCollection.find(query, options);
             const result = await cursor.toArray();
@@ -113,6 +174,32 @@ async function run() {
             res.send(result);
         });
 
+        app.patch('/parcels/:id', async(req,res) => {
+            const { riderId, riderName,riderEmail} = req.body;
+            const id = req.params.id;
+            const query = {_id: new ObjectId(id)}
+            const updatedDoc = {
+                $set: {
+                    deliveryStatus: 'rider-assigned',
+                    riderId: riderId,
+                    riderName: riderName,
+                    riderEmail: riderEmail,
+                }
+
+            }
+            const result = await parcelCollection.updateOne(query, updatedDoc)
+            // update the rider information
+            const riderQuery = {_id: new ObjectId(riderId)}
+            const riderUpdateDoc = {
+                $set: {
+                    workStatus: 'on-delivery',
+                }
+            }
+           const riderResult =  await ridersCollection.updateOne(riderQuery, riderUpdateDoc)
+
+           res.send(riderResult)
+        })
+
         app.delete("/parcels/:id", async (req, res) => {
             const id = req.params.id;
             const query = { _id: new ObjectId(id) };
@@ -121,65 +208,35 @@ async function run() {
         });
 
         // New payment
-        app.post("/payment-checkout-session", async (req, res) => {
-            const paymentInfo = req.body;
-            const amount = parseInt(paymentInfo.cost) * 100;
-            const session = await stripe.checkout.sessions.create({
-                line_items: [
-                    {
-                        // Provide the exact Price ID (for example, price_1234) of the product you want to sell
-                        price_data: {
-                            currency: "usd",
-                            unit_amount: amount,
-                            product_data: {
-                                name: `Please Pay for ${paymentInfo.parcelName}`,
-                            },
-                        },
-                        quantity: 1,
-                    },
-                ],
-                mode: "payment",
-                metadata: {
-                    parcelId: paymentInfo.parcelId,
-                    parcelName: paymentInfo.parcelName,
-                },
+         app.post("/payment-checkout-session", async (req, res) => {
+             const paymentInfo = req.body;
+             const amount = parseInt(paymentInfo.cost) * 100;
+             const session = await stripe.checkout.sessions.create({
+                 line_items: [
+                     {
+                         // Provide the exact Price ID (for example, price_1234) of the product you want to sell
+                         price_data: {
+                             currency: "usd",
+                             unit_amount: amount,
+                             product_data: {
+                                 name: `Please Pay for ${paymentInfo.parcelName}`,
+                             },
+                         },
+                         quantity: 1,
+                     },
+                 ],
+                 mode: "payment",
+                 metadata: {
+                     parcelId: paymentInfo.parcelId,
+                     parcelName: paymentInfo.parcelName,
+                 },
 
-                customer_email: paymentInfo.senderEmail,
-                success_url: `${process.env.SITE_DOMAIN}/dashboard/payment-success?session_id={CHECKOUT_SESSION_ID}`,
-                cancel_url: `${process.env.SITE_DOMAIN}/dashboard/payment-cancelled`,
-            });
-            res.send({ url: session.url });
-        });
-
-        //old payment method apis
-        app.post("/create-checkout-session", async (req, res) => {
-            const paymentInfo = req.body;
-            const amount = parseInt(paymentInfo.cost) * 100;
-            const session = await stripe.checkout.sessions.create({
-                line_items: [
-                    {
-                        price_data: {
-                            currency: "USD",
-                            unit_amount: amount,
-                            product_data: {
-                                name: paymentInfo.parcelName,
-                            },
-                        },
-
-                        quantity: 1,
-                    },
-                ],
-                customer_email: paymentInfo.senderEmail,
-                mode: "payment",
-                metadata: {
-                    parcelId: paymentInfo.parcelId,
-                },
-                success_url: `${process.env.SITE_DOMAIN}/dashboard/payment-success`,
-                cancel_url: `${process.env.SITE_DOMAIN}/dashboard/payment-cancelled`,
-            });
-            console.log(session);
-            res.send({ url: session.url });
-        });
+                 customer_email: paymentInfo.senderEmail,
+                 success_url: `${process.env.SITE_DOMAIN}/dashboard/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+                 cancel_url: `${process.env.SITE_DOMAIN}/dashboard/payment-cancelled`,
+             });
+             res.send({ url: session.url });
+         });
 
         app.patch("/payment-succes", async (req, res) => {
             const sessionId = req.query.session_id;
@@ -187,29 +244,31 @@ async function run() {
             // console.log("session retrieve", session);
 
             const transactionId = session.payment_intent;
-            const query = { transactionId: transactionId };
+            
 
-            const paymentExist = await paymentCollection.findOne(query);
-            console.log(paymentExist);
-            if (paymentExist) {
-                return res.send({
-                    message: "already exist",
-                    transactionId,
-                    trackingId: paymentExist.trackingId,
-                });
-            }
+            // const paymentExist = await paymentCollection.findOne(query);
+            // console.log(paymentExist);
+            // if (paymentExist) {
+            //     return res.send({
+            //         message: "already exist",
+            //         transactionId,
+            //         trackingId: paymentExist.trackingId,
+            //     });
+            // }
 
-            const trackingId = generateTrackingId();
+            
             if (session.payment_status === "paid") {
+                const trackingId = generateTrackingId();
                 const id = session.metadata.parcelId;
                 const query = { _id: new ObjectId(id) };
                 const update = {
                     $set: {
                         paymentStatus: "paid",
+                        deliveryStatus: "pending-pickup",
                         trackingId: trackingId,
                     },
                 };
-                const result = await parcelCollection.updateOne(query, update);
+                await parcelCollection.updateOne(query, update);
 
                 const payment = {
                     amount: session.amount_total / 100,
@@ -217,22 +276,33 @@ async function run() {
                     customerEmail: session.customer_email,
                     parcelId: session.metadata.parcelId,
                     parcelName: session.metadata.parcelName,
-                    transactionId: session.payment_intent,
+                    transactionId: transactionId,
                     paymentStatus: session.payment_status,
                     paidAt: new Date(),
                     trackingId: trackingId,
                 };
 
-                if (session.payment_status === "paid") {
-                    const resultPayment = await paymentCollection.insertOne(payment);
-                    res.send({
-                        success: true,
-                        modifyParcel: result,
-                        trackingId: trackingId,
-                        transactionId: session.payment_intent,
-                        paymentInfo: resultPayment,
-                    });
-                }
+                // if (session.payment_status === "paid") {
+                //     const resultPayment = await paymentCollection.insertOne(payment);
+                //     res.send({
+                //         success: true,
+                //         modifyParcel: result,
+                //         trackingId: trackingId,
+                //         transactionId: session.payment_intent,
+                //         paymentInfo: resultPayment,
+                //     });
+                // }
+                const resultPayment = await paymentCollection.updateOne(
+                    {transactionId: transactionId},
+                    {$setOnInsert: payment},
+                    {upsert: true}
+                )
+                return res.send({
+                    success: true,
+                    trackingId,
+                    transactionId,
+                    paymentInfo: resultPayment,
+                })
             }
 
             res.send({ success: false });
@@ -258,9 +328,16 @@ async function run() {
 
         // riders related apis
         app.get('/riders', async(req,res)=> {
+            const {status, riderDistrict, workStatus} = req.query;
             const query= {};
-            if(req.query.status){
-                query.status = req.queryy.status;
+            if(status){
+                query.status = status;
+            }
+            if (riderDistrict) {
+                query.riderDistrict = riderDistrict;
+            }
+            if(workStatus){
+                query.workStatus = workStatus;
             }
             const cursor = ridersCollection.find(query)
             const result = await cursor.toArray()
@@ -275,18 +352,19 @@ async function run() {
             res.send(result);
         });
         // aprove the rider
-        app.patch("/riders/:id",verifyFBToken,async(req, res) => {
+        app.patch("/riders/:id",verifyFBToken, verifyAdmin,async(req, res) => {
             const status = req.body.status;
             const id = req.params.id;
             const query = {_id: new ObjectId(id)}
             const updatedDoc = {
                 $set: {
                     status: status,
+                    workStatus: status === 'Approved' ? 'available' : 'pending',
                 }
             }
 
             const result = await ridersCollection.updateOne(query, updatedDoc)
-            if(status === 'Aproved'){
+            if(status === 'Approved'){
                 const email = req.body.email;
                 const userQuery = {email};
                 const updateUser = {
@@ -295,7 +373,7 @@ async function run() {
                     }
                     
                 }
-                const userResult = await userCollection.updateOne(userQuery, updateUser)
+                 await userCollection.updateOne(userQuery, updateUser)
                 
             }
             res.send(result)
